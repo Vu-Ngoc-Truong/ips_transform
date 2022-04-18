@@ -16,23 +16,25 @@ def yaml_dump(filepath,value):
             data = yaml.dump(value,read_file,sort_keys=True,indent=4 )
 
 def get_odom():
-    try:
+	try:
 
-        tf_listener = tf.TransformListener()
-        rospy.loginfo("Checking for transform between ar-tag and map frames")
-        tf_listener.waitForTransform("/base_link","/map",  rospy.Time(), rospy.Duration(4.0))
+		tf_listener = tf.TransformListener()
+		rospy.loginfo("Checking for transform between ar-tag and map frames")
+		tf_listener.waitForTransform("/map","/ips_link",  rospy.Time(), rospy.Duration(4.0))
 		# print(rospy.get_time())
-        rospy.loginfo("transform found :)")
-        pos, ori = tf_listener.lookupTransform('/base_link','/map',rospy.Time())
-        pose = (pos,ori)
-        ############ self.rot is in quaternion ############
+		rospy.loginfo("transform found :)")
+		pos, ori = tf_listener.lookupTransform('/ips_link','/map', rospy.Time(0))
+		pose = (pos,ori)
+		############ self.rot is in quaternion ############
 
-        rospy.loginfo("transformed successfully")
+		rospy.loginfo("transformed successfully")
+		# print(pos)
 
-        return pose
-    except(tf.Exception, tf.ConnectivityException, tf.LookupException):
-        rospy.loginfo("TF exception")
-        return False
+		return pose
+	except(tf.Exception, tf.ConnectivityException, tf.LookupException):
+		rospy.loginfo("TF exception")
+		return False
+
 def getRTfromQuat(translation, quat):
 
 	# pose_map = np.array([[-0.22571, 0.063645, 0.20089]])
@@ -107,11 +109,11 @@ def getQuatfromRT(RT):
 
 def getPoseIps(data):
 	# get coordinate from map
-    pose = get_odom()
-    print(pose)
-    if pose:
+	pose = get_odom()
+	print(pose)
+	if pose:
 		print("get odom")
-		# Get coordinate from ips
+		# Get coordinate from ip
 		position= np.array([data.x_m, data.y_m, 0])
 		orientation = np.array([0, 0, 0.4712])
 		# print("ips coordinate: {}".format(ips_coord))
@@ -125,25 +127,27 @@ def getPoseIps(data):
 		T_Map_IpsOrigin = T_Map_BaseLink*np.linalg.inv(T_IpsOrigin_BaseLink)
 		position = T_Map_IpsOrigin[0:3, -1]  # supress the z coordinate
 		orientation = getQuatfromRT(T_Map_IpsOrigin)
-		print ("position")
-		print (position)
-		print ("orientation")
-		print (orientation)
+		# print ("position")
+		# print (position)
+		# print ("orientation")
+		# print (orientation)
 		value= {'position_x': float(position[0]),
 				'position_y': float(position[1]),
 				'position_z': 0
 				}
 		print("value",value)
-		yaml_dump("config.yaml",value)
+		# yaml_dump("config.yaml",value)
 		print("succsess dump to yaml file")
 
 		# return position, orientation
 
 def main():
-    rospy.init_node("save_tf_map_IpsOrigin")
-    rospy.loginfo('Init node ' + rospy.get_name())
-    ips_sub = rospy.Subscriber("/hedge_pos", hedge_pos,getPoseIps)
-    rospy.spin()
+	rospy.init_node("save_tf_map_IpsOrigin")
+	rospy.loginfo('Init node ' + rospy.get_name())
+	# while True:
+	# 	a = get_odom()
+	ips_sub = rospy.Subscriber("/hedge_pos", hedge_pos,getPoseIps)
+	rospy.spin()
 
 
 
