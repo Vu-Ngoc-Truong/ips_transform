@@ -1,142 +1,275 @@
-#!/usr/bin/env python
+#! /usr/bin/env python
+# -*- coding: utf-8 -*-
 
-import numpy as np
-from math import cos, sin, pi, sqrt
+import os
+import os
+import sys
 import rospy
-from geometry_msgs.msg import Pose, Point, Quaternion, Twist
-from tf.transformations import euler_from_quaternion
-from geometry_msgs.msg import PoseWithCovarianceStamped
-from marvelmind_nav.msg import hedge_pos
+import rospkg
+import copy
+import json
 import yaml
-def yaml_load(filepath):
-    with open(filepath, "r") as read_file:
-        data = yaml.load(read_file, Loader=yaml.FullLoader)
-    return data
+from std_stamped_msgs.msg import StringStamped, StringAction, StringFeedback, StringResult, StringGoal, EmptyStamped
+import rospy
+from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
+from nav_msgs.msg import  Odometry
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
+from marvelmind_nav.msg import hedge_pos
+import numpy as np
+import tf
+from math import *
+from get_pose_function import get_pose, distance_from_coordinates, center_of_three_point
+
+common_func_dir = os.path.join(rospkg.RosPack().get_path('agv_common_library'), 'scripts')
+if not os.path.isdir(common_func_dir):
+    common_func_dir = os.path.join(rospkg.RosPack().get_path('agv_common_library'), 'release')
+sys.path.insert(0, common_func_dir)
+
+from common_function import (
+    MIN_FLOAT,
+    EnumString,
+    lockup_pose,
+    offset_pose_x,
+    offset_pose_yaw,
+    distance_two_pose,
+    delta_angle,
+    dict_to_obj,
+    merge_two_dicts,
+    print_debug,
+    print_info,
+    print_warn,
+    print_error,
+    obj_to_dict,
+    offset_pose_xy_theta,
+    angle_two_pose,
+    pose_dict_template
+)
+
+class MainState(EnumString):
+    NONE                = -1
+    STATE_1             = 0
+    STATE_2             = 1
+
+class PoseEstimate():
+	def __init__(self, name, *args, **kwargs):
+		self.init_variable(*args, **kwargs)
+		print("Name: ",name)
+		# Action
+
+		# Publisher
+		self.pub_init_pose = rospy.Publisher("/initialpose", PoseWithCovarianceStamped, queue_size=10)
+		self.pub_cmd_vel = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+		# Subscriber
+		rospy.Subscriber("/hedge_pos",hedge_pos,self.get_pose_ips_cb)
+		rospy.Subscriber("/final_cmd_vel_mux/output",Twist,self.final_cmd_vel_cb)
+		rospy.Subscriber("/odom",Odometry,self.get_odom_cb)
+        # Service
+
+		# self.loop()
+
+        # self.sub_ori_vslam = rospy.Subscriber("/oriVslam",,self.get_ori_vslam)
+
+	def init_variable(self, *args, **kwargs):
+		# Read YAML file
+		self.config_file = kwargs["config_file"]
+		rospy.loginfo("config_file: %s" % self.config_file)
+		self.cfg_file_path =os.path.join(rospkg.RosPack().get_path('ips_transform'), 'cfg', 'ips_config.yaml')
+
+		self.init_pose = PoseWithCovarianceStamped()
+		self.init_pose.pose.pose.position.x = 0
+		self.init_pose.pose.pose.position.y = 0
+		self.init_pose.pose.pose.position.z = 0
+		self.init_pose.pose.pose.orientation.x = 0
+		self.init_pose.pose.pose.orientation.z = 0
+		self.init_pose.pose.pose.orientation.y = 0
+		self.init_pose.pose.pose.orientation.w = 1
+		self.init_pose.pose.covariance = [0.25, 0.0, 0.0, 0.0, 0.0, 0.0,
+										0.0, 0.25, 0.0, 0.0, 0.0, 0.0,
+										0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+										0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+										0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+										0.0, 0.0, 0.0, 0.0, 0.0, 0.068]
+
+		# Get point when robot rotary self
+		self.state = "get_first_point"
+		self.position_rotary = list()
+		self.robot_angle_init = 0
+		self.robot_angle_tolerance = 0.2 # radian
+		# self.position_second =None
+		self.min_distance = 0.2 # met
+		self.rotation_vel = 0.5 # rad/s
+
+		# Get robot speed :
+		self.robot_cmd_vel_linear = 0
+		self.robot_cmd_vel_rotary = 0
+
+		# Set robot speed:
+		self.robot_cmd_vel = Twist()
+		self.robot_cmd_vel.linear.x  = 0
+		self.robot_cmd_vel.angular.z = 0
+
+		# Get robot odom:
+		self.robot_odom_angle_yaw = 0
 
 
-def getRTfromQuat(translation, quat):
-
-	# pose_map = np.array([[-0.22571, 0.063645, 0.20089]])
-	# orient_map = np.array([ -0.0027935, 0.70555, -0.0043037, 0.70864])
+	def shutdown(self):
+		rospy.loginfo("Shuting down")
 
 
-	# print quat
-	[roll1,pitch1,yaw1] = euler_from_quaternion(np.asarray(quat))
-	# print roll1, pitch1, yaw1
-	Rp1=np.matrix([[cos((pitch1)), 0, sin((pitch1))],\
-	     		   [0            , 1,             0],\
-	     		   [-sin(pitch1) , 0, cos((pitch1))]])
+
+	def yaml_load(self,filepath):
+		with open(filepath, "r") as read_file:
+			data = yaml.load(read_file, Loader=yaml.FullLoader)
+		return data
+
+	"""
+	 ######     ###    ##       ##       ########     ###     ######  ##    ##
+	##    ##   ## ##   ##       ##       ##     ##   ## ##   ##    ## ##   ##
+	##        ##   ##  ##       ##       ##     ##  ##   ##  ##       ##  ##
+	##       ##     ## ##       ##       ########  ##     ## ##       #####
+	##       ######### ##       ##       ##     ## ######### ##       ##  ##
+	##    ## ##     ## ##       ##       ##     ## ##     ## ##    ## ##   ##
+	 ######  ##     ## ######## ######## ########  ##     ##  ######  ##    ##
+	"""
+
+	def get_pose_ips_cb(self,msg):
+		pose_ips = np.array([msg.x_m, msg.y_m, 0])
+		orien_ips = np.array([0,0,0])
+		TTT = get_pose(pose_ips, orien_ips, self.cfg_file_path)
+		# print(TTT)
+		pose_map_xy = np.array([TTT[0,0],TTT[1,0]])
+		# print("position x: {}	y : {}".format(format(pose_map_xy[0],'0.4f'),format(pose_map_xy[1],'0.4f')))
+
+		if self.state == "get_first_point":
+			rospy.loginfo("state: {}".format(self.state))
+			self.position_rotary.append(pose_map_xy)
+			self.state = "get_2nd_point"
+			# Get current angle of robot:
+			self.robot_angle_init = self.robot_odom_angle_yaw
+			# Rotary robot
+			self.robot_cmd_vel.linear.x  = 0
+			self.robot_cmd_vel.angular.z = self.rotation_vel
+			self.pub_cmd_vel.publish(self.robot_cmd_vel)
 
 
-	Ry1=np.matrix([[cos((yaw1)) ,-sin((yaw1)) ,0],\
-	     [sin((yaw1)), cos((yaw1)), 0],\
-	     [0, 0, 1]])
+		elif self.state == "get_2nd_point":
+			rospy.loginfo("state: {}".format(self.state))
+			distance = distance_from_coordinates(self.position_rotary[0],pose_map_xy)
+			print("distance : {}".format(distance))
+			# Rotary robot
+			self.robot_cmd_vel.linear.x  = 0
+			self.robot_cmd_vel.angular.z = self.rotation_vel
+			self.pub_cmd_vel.publish(self.robot_cmd_vel)
+			# print(abs(distance))
+			if  distance > self.min_distance  :
+				self.position_rotary.append(pose_map_xy)
+				rospy.loginfo("Point 2 OK")
+				self.state = "get_3rd_point"
+			elif distance <= self.min_distance :
+				rospy.logwarn("distance travel not enough!")
 
-	Rr1=np.matrix([[1 ,0 ,0],\
-	    [0 ,cos((roll1)), -sin((roll1))],\
-	    [0 ,sin((roll1)) ,cos((roll1))]])
+		elif self.state == "get_3rd_point":
+			rospy.loginfo("state: {}".format(self.state))
+			distance = distance_from_coordinates(self.position_rotary[1],pose_map_xy)
+			print("distance : {}".format(distance))
+			# print(abs(distance))
+			if  distance > self.min_distance  :
+				rospy.loginfo("Point 3 OK")
+				self.position_rotary.append(pose_map_xy)
+				self.state = "get_3_point_complete"
+			elif distance <= self.min_distance :
+				rospy.logwarn("distance travel not enough!")
+							# Rotary robot
+				self.robot_cmd_vel.linear.x  = 0
+				self.robot_cmd_vel.angular.z = self.rotation_vel
+				self.pub_cmd_vel.publish(self.robot_cmd_vel)
+		elif self.state == "get_3_point_complete":
+			rospy.loginfo("state: {}".format(self.state))
+			center, radius, yaw = center_of_three_point(self.position_rotary[0],self.position_rotary[1],self.position_rotary[2])
+			self.init_pose.pose.pose.position.x = center[0]
+			self.init_pose.pose.pose.position.y = center[1]
+			yaw = yaw - 0.7854	# offset with tf ips_base link
+			self.init_pose.pose.pose.orientation.x = quaternion_from_euler(0,0,yaw)[0]
+			self.init_pose.pose.pose.orientation.y = quaternion_from_euler(0,0,yaw)[1]
+			self.init_pose.pose.pose.orientation.z = quaternion_from_euler(0,0,yaw)[2]
+			self.init_pose.pose.pose.orientation.w = quaternion_from_euler(0,0,yaw)[3]
+			# print(quaternion_from_euler(0,0,yaw))
+			rospy.loginfo("Base link: {}  yaw: {}".format(self.state,degrees(yaw)))
+			self.pub_init_pose.publish(self.init_pose)
+			self.state = "rotation to init angle"
 
-	R1=Ry1*Rp1*Rr1
-
-	R = np.asarray(R1)
-	R = np.vstack((R, np.array([0,0,0])))
-
-
-	R = np.hstack((R, np.array([[translation.item(0)],[translation.item(1)],[translation.item(2)],[1]])))
-	# print(R)
-	return R
-def getRTfromEuler(translation ,euler):
-	roll = euler[0]
-	pitch = euler[1]
-	yaw = euler[2]
-	Rp1=np.matrix([[cos((pitch)), 0, sin((pitch))],\
-	     		   [0            , 1,             0],\
-	     		   [-sin(pitch) , 0, cos((pitch))]])
-
-
-	Ry1=np.matrix([[cos((yaw)) ,-sin((yaw)) ,0],\
-	     [sin((yaw)), cos((yaw)), 0],\
-	     [0, 0, 1]])
-
-	Rr1=np.matrix([[1 ,0 ,0],\
-	    [0 ,cos((roll)), -sin((roll))],\
-	    [0 ,sin((roll)) ,cos((roll))]])
-
-	R1=Ry1*Rp1*Rr1
-
-	R = np.asarray(R1)
-	R = np.vstack((R, np.array([0,0,0])))
-
-
-	R = np.hstack((R, np.array([[translation.item(0)],[translation.item(1)],[translation.item(2)],[1]])))
-	# print(R)
-	return R
-def getQuatfromRT(RT):
-	qw = sqrt(1+RT[0,0] + RT[1,1]+ RT[2,2])/2
-	qx = (RT[2,1] - RT[1,2])/(4*qw)
-	qy = (RT[0,2] - RT[2,0])/(4*qw)
-	qz = (RT[1,0] - RT[0,1])/(4*qw)
-	return np.array([qx, qy, qz, qw])
-
-# def getPOSE(poseODOM_ar3, orientODOM_ar3):
-
-"""
-	Ground truth about ar tag pose_map
-"""
-# posemap_AR = np.array([[-0.22571, 0.063645, 0.20089]])
-# orientmap_AR = np.array([ -0.0027935, 0.70555, -0.0043037, 0.70864])
-
-
-#
-# posemap_AR = np.array([[3.3404, 0.516725, 0.344577]])
-# orientmap_AR = np.array([-0.0118515, -0.72394, 0.0075599, 0.68972])
-
-poseMap_sendGoal = np.array([[-6.654101848602295, 2.6939444541931152,10]])
-orientMap_sendGoal = np.array([0, 0, -0.016154152818269988, 0.9998695131599543])
-poseSendGoal_AR = np.array([[0, 0, 0]])
-orientSendGoal_AR = np.array([1.57, 0, 1.57])
-
-"""
-	Robot pose wrt to tag in disoriented map
-"""
+		elif self.state == "rotation to init angle":
+			rospy.loginfo("state: {}".format(self.state))
+			# Slow robot
+			self.robot_cmd_vel.linear.x  = 0
+			self.robot_cmd_vel.angular.z = self.rotation_vel
+			self.pub_cmd_vel.publish(self.robot_cmd_vel)
+			if abs(self.robot_angle_init - self.robot_odom_angle_yaw) < self.robot_angle_tolerance:
+				# Stop robot
+				self.robot_cmd_vel.linear.x  = 0
+				self.robot_cmd_vel.angular.z = 0
+				self.pub_cmd_vel.publish(self.robot_cmd_vel)
+				self.state = "init_pose_complete"
+				rospy.loginfo("state: {}".format(self.state))
 
 
-# poseODOM_ar3 = np.array([0.21105, 0.13398, 1.736]);
-# orientODOM_ar3 = np.array([ -0.0312144, -0.704887, 0.0224505, 0.708277])
+	def final_cmd_vel_cb(self,msg):
+		self.robot_cmd_vel_linear = msg.linear.x
+		self.robot_cmd_vel_rotary = msg.angular.z
 
-# poseODOM_ar3 = np.array([[-0.32219, 0.18232, 1.1379]])
-# orientODOM_ar3 = np.array([0.052972, 0.71198, -0.0866, 0.696344])
-def get_pose(msg):
-	data = yaml_load("config.yaml")
-	# print(data)
-	pos = np.array([[data["position_x"], data["position_y"], 0.0]])
-	ori = np.array([data["roll"], data["pitch"], data["yaw"]])
+	def get_odom_cb(self,msg):
+		self.robot_odom_angle_yaw = euler_from_quaternion([msg.pose.pose.orientation.x,msg.pose.pose.orientation.y,
+														msg.pose.pose.orientation.z,msg.pose.pose.orientation.w])[2]
 
-	posIps = np.array([msg.x_m, msg.y_m, 0.0])
-	oriIps = [0,0,0]
-	T_1 = np.asmatrix(getRTfromEuler(pos, ori))
-	T_2 = np.asmatrix(getRTfromEuler(posIps, oriIps))
-	T = T_1*T_2
-	Rr = T[0:3, 0:3]
-	position = T[0:3, -1]  #supress the z coordinate
-	print(position)
-	orientation = getQuatfromRT(T)
-	# print ("position")
-	# print (position)
-	# print ("orientation")
-	# #print (orientation)
 
+	"""
+	##        #######   #######  ########
+	##       ##     ## ##     ## ##     ##
+	##       ##     ## ##     ## ##     ##
+	##       ##     ## ##     ## ########
+	##       ##     ## ##     ## ##
+	##       ##     ## ##     ## ##
+	########  #######   #######  ##
+	"""
+
+	def loop(self):
+		_state = MainState.NONE
+		_prev_state = MainState.NONE
+		rate = rospy.Rate(10.0)
+		while not rospy.is_shutdown():
+			if _state != _prev_state:
+				print_debug('State: {} -> {}'.format(_prev_state.toString(), _state.toString()))
+				_prev_state = _state
+
+			if _state == MainState.STATE_1:
+				_state = MainState.STATE_2
+			elif _state == MainState.STATE_2:
+				_state = MainState.STATE_1
+			rate.sleep()
+
+
+def parse_opts():
+    from optparse import OptionParser
+    parser = OptionParser()
+    parser.add_option("-d", "--ros_debug",
+                    action="store_true", dest="log_debug", default=False, help="log_level=rospy.DEBUG")
+    parser.add_option("-c", "--config_file", dest="config_file",
+                    default=os.path.join(rospkg.RosPack().get_path('ips_transform'), 'cfg', 'config.yaml'))
+
+    (options, args) = parser.parse_args()
+    print("Options:\n{}".format(options))
+    print("Args:\n{}".format(args))
+    return (options, args)
 
 def main():
-	rospy.init_node("pose_calc_from_ips")
+	(options, args) = parse_opts()
+	log_level = None
+	if options.log_debug:
+		log_level = rospy.DEBUG
+	rospy.init_node('pose_init_with_ips', log_level=log_level)
 	rospy.loginfo('Init node ' + rospy.get_name())
-	# while True:
-	# 	a = get_odom()
-	# ips_pose_pub = rospy.Publisher("/pose_calc_from_ips",Pose,queue_size=10)
-	ips_pose_sub = rospy.Subscriber("/hedge_pos", hedge_pos,get_pose)
+	PoseEstimate(rospy.get_name(), **vars(options))
 	rospy.spin()
 
-
-if __name__ == "__main__":
-
+if __name__ == '__main__':
     main()
